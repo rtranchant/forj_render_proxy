@@ -38,10 +38,21 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
-    const upstream = await fetch(UPSTREAM + req.url, {
-      method: 'GET',
-      headers: { 'Authorization': req.headers['authorization'] }
-    });
+    let url = UPSTREAM + req.url;
+    let upstream;
+    for (let hop = 0; hop < 5; hop++) {
+      upstream = await fetch(url, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: { 'Authorization': req.headers['authorization'] }
+      });
+      const loc = upstream.headers.get('location');
+      if (upstream.status >= 300 && upstream.status < 400 && loc) {
+        url = new URL(loc, url).toString();   // follow, re-attaching auth
+        continue;
+      }
+      break;
+    }
     const body = await upstream.text();
     res.writeHead(upstream.status, {
       'Content-Type': upstream.headers.get('content-type') || 'application/json'
