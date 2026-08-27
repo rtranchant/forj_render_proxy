@@ -1,0 +1,12 @@
+{
+  "name": "forj-cors-proxy",
+  "version": "1.0.0",
+  "description": "CORS proxy for the Journey by Forj (Mobilize) v1 API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
