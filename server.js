@@ -10,6 +10,12 @@
 //
 // This build restores both. Nothing either service relied on is removed.
 //
+// 27 SEP: PARTNER CONTACTS
+// Adds the HubSpot endpoints the Partner Contacts manager needs, as an exact
+// allow-list: batch reads, plus the writes that change contact roles, EA
+// links and new contacts. Every other HubSpot POST is still refused. The
+// existing Forj and HubSpot read routes are unchanged.
+//
 // ROUTES
 //   OPTIONS *                       -> 204, CORS preflight. Answered FIRST, before
 //                                      any auth check: a preflight carries no
@@ -18,7 +24,9 @@
 //   GET  /healthz                   -> {ok, routes, methods, writeTokenRequired}
 //   GET  /hubspot/<path>            -> api.hubapi.com/<path>, Bearer from X-Hubspot-Token
 //   POST /hubspot/crm/v3/objects/<type>/search
-//                                   -> same. HubSpot's search is a POST but a read;
+//                                   -> same. HubSpot's search is a POST but a read.
+//   POST /hubspot/<Partner Contacts endpoints>
+//                                   -> same. See HUBSPOT_POST_READS / _WRITES;
 //                                      every other HubSpot POST is refused (405).
 //   GET  /<path>                    -> api.mobilize.io/v1/<path>, Authorization relayed
 //   POST|PUT /<path>                -> same, writes. Guarded by WRITE_TOKEN if set.
@@ -42,8 +50,20 @@ const FORJ_READ   = ['GET'];
 const FORJ_WRITE  = ['POST', 'PUT'];
 const FORJ_METHODS = FORJ_READ.concat(FORJ_WRITE);
 
-// HubSpot stays read-only. Search is the one POST that reads.
-const HUBSPOT_POST_ALLOW = /^\/crm\/v3\/objects\/[a-z0-9_]+\/search$/;
+// HubSpot POSTs allowed through, and nothing else.
+const HUBSPOT_POST_READS = [
+  /^\/crm\/v3\/objects\/[a-z0-9_]+\/search$/,                          // search (all pages)
+  /^\/crm\/v3\/objects\/contacts\/batch\/read$/,                          // Partner Contacts
+  /^\/crm\/v4\/associations\/(companies|contacts)\/(contacts|companies)\/batch\/read$/,
+];
+const HUBSPOT_POST_WRITES = [                                              // Partner Contacts only
+  /^\/crm\/v3\/objects\/contacts$/,                                          // create a contact
+  /^\/crm\/v4\/associations\/contacts\/(companies|contacts)\/batch\/create$/,      // add a role / EA link
+  /^\/crm\/v4\/associations\/contacts\/(companies|contacts)\/batch\/labels\/archive$/, // remove a role
+  /^\/crm\/v4\/associations\/contacts\/contacts\/batch\/archive$/,              // unlink an EA
+];
+const hubspotPostAllowed = p => HUBSPOT_POST_READS.concat(HUBSPOT_POST_WRITES).some(r => r.test(p));
+const isHubspotWrite = p => HUBSPOT_POST_WRITES.some(r => r.test(p));
 
 // Every header any of the pages sends. X-Hubspot-Token is the one the
 // group-console build dropped.
@@ -115,7 +135,8 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, {
       ok: true,
       routes: ['forj', 'hubspot'],
-      methods: { forj: FORJ_METHODS, hubspot: ['GET', 'POST (search only)'] },
+      methods: { forj: FORJ_METHODS, hubspot: ['GET', 'POST (search, batch reads, Partner Contacts writes)'] },
+      hubspotWrites: true,
       writeTokenRequired: !!WRITE_TOKEN
     });
   }
@@ -131,15 +152,20 @@ const server = http.createServer(async (req, res) => {
         return send(res, 401, { error_message: 'Missing X-Hubspot-Token header' });
       if (req.method !== 'GET' && req.method !== 'POST')
         return send(res, 405, { error_message: req.method + ' is not allowed on the HubSpot route' });
-      if (req.method === 'POST' && !HUBSPOT_POST_ALLOW.test(pathOnly))
-        return send(res, 405, { error_message: 'Only CRM search POSTs are allowed through this proxy' });
+      if (req.method === 'POST' && !hubspotPostAllowed(pathOnly))
+        return send(res, 405, { error_message: 'This HubSpot endpoint is not allowed through this proxy' });
 
       const opts = { method: req.method, headers: { 'Authorization': 'Bearer ' + token } };
       if (req.method === 'POST') {
         opts.headers['Content-Type'] = 'application/json';
         opts.body = await readBody(req);
       }
-      return relay(res, await forward(HUBSPOT_UPSTREAM + path, opts));
+      const hsUpstream = await forward(HUBSPOT_UPSTREAM + path, opts);
+      await relay(res, hsUpstream);
+      // Audit trail for HubSpot writes: path and status only, never the body.
+      if (req.method === 'POST' && isHubspotWrite(pathOnly))
+        console.log(new Date().toISOString(), 'HUBSPOT POST', pathOnly, '->', hsUpstream.status);
+      return;
     }
 
     /* -------------------------------- Forj -------------------------------- */
@@ -175,6 +201,6 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log('Forj + HubSpot proxy listening on port ' + PORT +
     ' | forj: ' + FORJ_METHODS.join(',') +
-    ' | hubspot: GET + search POST' +
+    ' | hubspot: GET + search + Partner Contacts' +
     (WRITE_TOKEN ? ' | write token required' : ' | no write token set'));
 });
