@@ -16,12 +16,22 @@
 // links and new contacts. Every other HubSpot POST is still refused. The
 // existing Forj and HubSpot read routes are unchanged.
 //
+// 1 OCT: CALENDAR FEEDS
+// Adds GET /ics?url=<feed> for the Master Calendar page, which needs to
+// download public .ics feeds that don't send CORS headers. It is read-only and
+// deliberately narrow: GET only, http/https/webcal URLs only, no credentials
+// or cookies are forwarded, private and internal addresses are refused on
+// every redirect hop, the response must actually be a calendar, and size and
+// time are capped. Set ICS_ALLOWED_HOSTS to restrict it to known hosts.
+// Forj and HubSpot routes are unchanged.
+//
 // ROUTES
 //   OPTIONS *                       -> 204, CORS preflight. Answered FIRST, before
 //                                      any auth check: a preflight carries no
 //                                      credentials, so checking them here would
 //                                      reject every preflight.
 //   GET  /healthz                   -> {ok, routes, methods, writeTokenRequired}
+//   GET  /ics?url=<encoded feed URL> -> the .ics file, as text/calendar. No auth.
 //   GET  /hubspot/<path>            -> api.hubapi.com/<path>, Bearer from X-Hubspot-Token
 //   POST /hubspot/crm/v3/objects/<type>/search
 //                                   -> same. HubSpot's search is a POST but a read.
@@ -36,15 +46,24 @@
 //                      Leave unset unless the group console has a field for it.
 //   FORJ_UPSTREAM      default https://api.mobilize.io/v1      (override for testing)
 //   HUBSPOT_UPSTREAM   default https://api.hubapi.com          (override for testing)
+//   ICS_ALLOWED_HOSTS  optional, comma-separated. If set, /ics only fetches from
+//                      these hosts or their subdomains (e.g. "calendar.google.com,
+//                      outlook.office365.com,lu.ma"). Unset = any public host.
 //
 // No credentials are stored or logged. No dependencies. Node 18+.
 
 const http = require('http');
+const dns  = require('dns').promises;
+const net  = require('net');
 
 const PORT             = process.env.PORT || 8010;
 const FORJ_UPSTREAM    = process.env.FORJ_UPSTREAM    || 'https://api.mobilize.io/v1';
 const HUBSPOT_UPSTREAM = process.env.HUBSPOT_UPSTREAM || 'https://api.hubapi.com';
 const WRITE_TOKEN      = process.env.WRITE_TOKEN || '';
+const ICS_ALLOWED_HOSTS = (process.env.ICS_ALLOWED_HOSTS || '')
+  .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
+const ICS_MAX_BYTES    = 10 * 1024 * 1024;   // 10 MB, far above any real feed
+const ICS_TIMEOUT_MS   = 20000;
 
 const FORJ_READ   = ['GET'];
 const FORJ_WRITE  = ['POST', 'PUT'];
@@ -115,6 +134,85 @@ async function forward(url, opts) {
   return upstream;
 }
 
+/* ------------------------------ Calendar feeds ------------------------------ */
+// An open URL fetcher is the classic way into a server's private network, so
+// every hop is checked: the host must resolve only to public addresses.
+function isPrivateIp(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) ||          // carrier-grade NAT
+      (a === 169 && b === 254) ||                    // link-local / cloud metadata
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 192 && b === 0) || (a === 198 && (b === 18 || b === 19));
+  }
+  const v = ip.toLowerCase();
+  if (v.startsWith('::ffff:')) return isPrivateIp(v.slice(7));
+  return v === '::' || v === '::1' || v.startsWith('fc') || v.startsWith('fd') ||
+    v.startsWith('fe8') || v.startsWith('fe9') || v.startsWith('fea') || v.startsWith('feb') ||
+    v.startsWith('ff');
+}
+
+async function checkIcsUrl(raw) {
+  let u;
+  try { u = new URL(raw.trim().replace(/^webcal:\/\//i, 'https://')); }
+  catch { throw Object.assign(new Error('Not a valid URL'), { code: 400 }); }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:')
+    throw Object.assign(new Error('Only http, https and webcal URLs are allowed'), { code: 400 });
+  if (u.username || u.password)
+    throw Object.assign(new Error('URLs with embedded credentials are not allowed'), { code: 400 });
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (ICS_ALLOWED_HOSTS.length && !ICS_ALLOWED_HOSTS.some(h => host === h || host.endsWith('.' + h)))
+    throw Object.assign(new Error('Host ' + host + ' is not in ICS_ALLOWED_HOSTS'), { code: 403 });
+  let addrs;
+  try { addrs = net.isIP(host) ? [{ address: host }] : await dns.lookup(host, { all: true }); }
+  catch { throw Object.assign(new Error('Could not resolve ' + host), { code: 502 }); }
+  if (!addrs.length || addrs.some(a => isPrivateIp(a.address)))
+    throw Object.assign(new Error('Private or internal addresses are not allowed'), { code: 403 });
+  return u;
+}
+
+async function readCapped(upstream) {
+  const reader = upstream.body.getReader();
+  const chunks = []; let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.length;
+    if (size > ICS_MAX_BYTES) { reader.cancel(); throw Object.assign(new Error('Feed is larger than 10 MB'), { code: 502 }); }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+async function fetchIcs(raw) {
+  let u = await checkIcsUrl(raw);
+  const signal = AbortSignal.timeout(ICS_TIMEOUT_MS);
+  for (let hop = 0; hop < 5; hop++) {
+    const upstream = await fetch(u, {
+      redirect: 'manual', signal,
+      headers: {
+        // Some hosts refuse requests without a browser-like UA.
+        'User-Agent': 'Mozilla/5.0 (compatible; MasterCalendar-ICS/1.0)',
+        'Accept': 'text/calendar, text/plain;q=0.9, */*;q=0.5'
+      }
+    });
+    const loc = upstream.headers.get('location');
+    if (upstream.status >= 300 && upstream.status < 400 && loc) {
+      u = await checkIcsUrl(new URL(loc, u).toString());   // re-check every hop
+      continue;
+    }
+    if (!upstream.ok)
+      throw Object.assign(new Error('Calendar host returned HTTP ' + upstream.status), { code: 502 });
+    const text = await readCapped(upstream);
+    if (!/BEGIN:VCALENDAR/i.test(text.slice(0, 4096)))
+      throw Object.assign(new Error('That URL did not return a calendar (.ics) file'), { code: 502 });
+    return text;
+  }
+  throw Object.assign(new Error('Too many redirects'), { code: 502 });
+}
+
 async function relay(res, upstream) {
   const text = await upstream.text();
   cors(res);
@@ -134,11 +232,40 @@ const server = http.createServer(async (req, res) => {
   if (req.url === '/healthz') {
     return send(res, 200, {
       ok: true,
-      routes: ['forj', 'hubspot'],
-      methods: { forj: FORJ_METHODS, hubspot: ['GET', 'POST (search, batch reads, Partner Contacts writes)'] },
+      routes: ['forj', 'hubspot', 'ics'],
+      methods: { forj: FORJ_METHODS, hubspot: ['GET', 'POST (search, batch reads, Partner Contacts writes)'], ics: ['GET'] },
       hubspotWrites: true,
+      icsAllowedHosts: ICS_ALLOWED_HOSTS.length ? ICS_ALLOWED_HOSTS : 'any public host',
       writeTokenRequired: !!WRITE_TOKEN
     });
+  }
+
+  /* ------------------------------ Calendar feeds ------------------------------ */
+  // Matched before the Forj route, which would otherwise demand Authorization.
+  if (req.url === '/ics' || req.url.startsWith('/ics?')) {
+    if (req.method !== 'GET')
+      return send(res, 405, { error_message: 'Only GET is allowed on /ics' });
+    const target = new URL(req.url, 'http://x').searchParams.get('url');
+    if (!target)
+      return send(res, 400, { error_message: 'Add ?url=<encoded .ics URL>' });
+    try {
+      const text = await fetchIcs(target);
+      cors(res);
+      res.writeHead(200, {
+        'Content-Type': 'text/calendar; charset=utf-8',
+        'Cache-Control': 'public, max-age=300',
+        'X-Content-Type-Options': 'nosniff'
+      });
+      return res.end(text);
+    } catch (e) {
+      const msg = e.name === 'TimeoutError' ? 'Calendar host took too long to respond'
+        : e.message === 'fetch failed' ? 'Could not reach the calendar host' + (e.cause && e.cause.code ? ' (' + e.cause.code + ')' : '')
+        : e.message;
+      // Host only, never the full URL: private feed links carry secret tokens.
+      let host = '?'; try { host = new URL(target.replace(/^webcal:/i, 'https:')).hostname; } catch {}
+      console.log(new Date().toISOString(), 'ICS', host, '->', e.code || 502, msg);
+      return send(res, e.code || 502, { error_message: msg });
+    }
   }
 
   try {
@@ -199,8 +326,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log('Forj + HubSpot proxy listening on port ' + PORT +
+  console.log('Forj + HubSpot + ICS proxy listening on port ' + PORT +
     ' | forj: ' + FORJ_METHODS.join(',') +
     ' | hubspot: GET + search + Partner Contacts' +
+    ' | ics: GET' + (ICS_ALLOWED_HOSTS.length ? ' (' + ICS_ALLOWED_HOSTS.join(',') + ')' : ' (any public host)') +
     (WRITE_TOKEN ? ' | write token required' : ' | no write token set'));
 });
